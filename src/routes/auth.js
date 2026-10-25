@@ -1,13 +1,20 @@
 import { Router } from "express";
 import crypto from "crypto";
+import bcrypt from "bcrypt";
+import { Resend } from "resend";
 import { verifyMessage } from "viem";
 import { z } from "zod";
+import { isValidPhoneNumber } from "libphonenumber-js";
 import { supabase, createAuthClient } from "../supabase.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.js";
-import { authLimiter } from "../middleware/rateLimit.js";
+import { authLimiter, otpSendLimiter } from "../middleware/rateLimit.js";
+import { RESTRICTED_COUNTRY_CODES } from "../config/restricted-countries.js";
+import { config } from "../config.js";
 
 const router = Router();
 router.use(authLimiter);
+
+const resend = new Resend(config.RESEND_API_KEY);
 
 async function recordAuditLog(userId, action, details = {}, ip = null) {
   try {
@@ -22,11 +29,45 @@ async function recordAuditLog(userId, action, details = {}, ip = null) {
   }
 }
 
+function generateReferralCode() {
+  return "NSP-" + crypto.randomBytes(4).toString("hex").toUpperCase();
+}
+
+async function generateUniqueUserId() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const uid = "UID" + String(crypto.randomInt(100000, 999999));
+    const { data } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("unique_user_id", uid)
+      .maybeSingle();
+    if (!data) return uid;
+  }
+  throw new Error("Could not generate unique user ID");
+}
+
+// ─── Schemas ──────────────────────────────────────────────────────────────────
+
 const registerSchema = z.object({
+  displayName: z.string().trim().min(2, "Name must be at least 2 characters").max(50),
   email: z.string().trim().toLowerCase().email("Invalid email address").max(254),
-  password: z.string().min(6, "Password must be at least 6 characters").max(100),
-  displayName: z.string().trim().min(2, "Name must be at least 2 characters").max(50).optional(),
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters")
+    .max(100)
+    .refine((v) => /[A-Z]/.test(v), "Password must contain an uppercase letter")
+    .refine((v) => /[a-z]/.test(v), "Password must contain a lowercase letter")
+    .refine((v) => /[0-9]/.test(v), "Password must contain a number")
+    .refine((v) => /[^A-Za-z0-9]/.test(v), "Password must contain a special character"),
+  mobileNumber: z
+    .string()
+    .refine((v) => isValidPhoneNumber(v), "Invalid mobile number (must be E.164 format)"),
+  countryCode: z.string().min(2, "Country code required"),
+  countryIso2: z.string().length(2).toUpperCase(),
+  country: z.string().min(1, "Country name required"),
+  timezone: z.string().default("UTC"),
   referralCode: z.string().trim().optional(),
+  agreeTerms: z.literal(true, { errorMap: () => ({ message: "You must agree to the terms" }) }),
 });
 
 const loginSchema = z.object({
@@ -41,13 +82,21 @@ const nonceSchema = z.object({
 const verifyWalletSchema = z.object({
   address: z.string().regex(/^0x[a-fA-F0-9]{40}$/, "Invalid EVM wallet address"),
   signature: z.string().startsWith("0x", "Invalid signature format"),
+  message: z.string().optional(),
 });
 
-function generateReferralCode() {
-  return "NSP-" + crypto.randomBytes(4).toString("hex").toUpperCase();
-}
+const otpSendSchema = z.object({
+  destination: z.string().email("Valid email required"),
+  type: z.enum(["registration", "login", "reset"]),
+});
 
-// POST /api/auth/register
+const otpVerifySchema = z.object({
+  destination: z.string().email("Valid email required"),
+  code: z.string().length(6).regex(/^\d{6}$/, "Code must be 6 digits"),
+  type: z.string(),
+});
+
+// ─── POST /api/auth/register ───────────────────────────────────────────────────
 router.post("/register", async (req, res) => {
   const result = registerSchema.safeParse(req.body);
   if (!result.success) {
@@ -59,128 +108,104 @@ router.post("/register", async (req, res) => {
     return res.status(400).json({ error: "Invalid registration input", fields });
   }
 
-  const { email, password, displayName, referralCode } = result.data;
+  const {
+    displayName,
+    email,
+    password,
+    mobileNumber,
+    countryCode,
+    countryIso2,
+    country,
+    timezone,
+    referralCode,
+  } = result.data;
 
   try {
-    const refCode = generateReferralCode();
-    const name = displayName || email.split("@")[0];
+    // Check restricted country
+    if (RESTRICTED_COUNTRY_CODES.includes(countryIso2)) {
+      return res.status(403).json({ error: "Service not available in your country" });
+    }
 
-    // Validate referral attribution on backend
+    // Resolve referral
+    let sponsorId = null;
     let validReferredBy = null;
     if (referralCode && typeof referralCode === "string") {
       const cleanRef = referralCode.trim().toUpperCase();
-      try {
-        const { data: referrerProfile } = await supabase
-          .from("profiles")
-          .select("id, referral_code, email")
-          .eq("referral_code", cleanRef)
-          .maybeSingle();
+      const { data: referrerProfile } = await supabase
+        .from("profiles")
+        .select("id, referral_code, email")
+        .ilike("referral_code", cleanRef)
+        .maybeSingle();
 
-        if (referrerProfile) {
-          // Prevent self-referral (cannot refer own email)
-          if (referrerProfile.email?.toLowerCase() !== email.toLowerCase()) {
-            validReferredBy = referrerProfile.referral_code;
-          } else {
-            console.warn(`Prevented self-referral attempt for email ${email} with code ${cleanRef}`);
-          }
-        } else {
-          console.warn(`Referral code ${cleanRef} not found in database. Proceeding without attribution.`);
+      if (referrerProfile) {
+        if (referrerProfile.email?.toLowerCase() === email.toLowerCase()) {
+          return res.status(400).json({ error: "You cannot use your own referral code" });
         }
-      } catch (refErr) {
-        console.warn("Notice: referral code lookup warning:", refErr?.message);
+        sponsorId = referrerProfile.id;
+        validReferredBy = referrerProfile.referral_code;
       }
+      // Unknown referral code: silently ignored (referredBy stays null)
     }
 
-    let userId = null;
-    let session = null;
-
-    // Use admin.createUser to avoid Supabase SMTP/email send rate limits and ensure verified account
+    // Create Supabase auth user
     const { data: adminData, error: adminError } = await supabase.auth.admin.createUser({
       email,
       password,
       email_confirm: true,
-      user_metadata: {
-        display_name: name,
-        referred_by: validReferredBy,
-      },
+      user_metadata: { display_name: displayName, referred_by: validReferredBy },
     });
 
-    if (adminData?.user) {
-      userId = adminData.user.id;
-    } else if (adminError && adminError.message?.toLowerCase().includes("already registered")) {
-      return res.status(400).json({ error: "An account with this email address already exists" });
-    } else {
-      // Fallback to standard signUp
-      const { data: authData, error: authError } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          data: {
-            display_name: name,
-            referred_by: validReferredBy,
-          },
-        },
-      });
-
-      if (authError) {
-        console.error("Supabase signUp error:", authError);
-        return res.status(400).json({ error: authError.message });
+    if (adminError) {
+      if (adminError.message?.toLowerCase().includes("already registered")) {
+        return res.status(400).json({ error: "An account with this email address already exists" });
       }
-
-      userId = authData.user?.id;
-      session = authData.session;
+      console.error("createUser error:", adminError);
+      return res.status(400).json({ error: adminError.message });
     }
 
-    if (!userId) {
-      return res.status(500).json({ error: "Failed to initialize user identity" });
-    }
+    const userId = adminData.user.id;
+    const refCode = generateReferralCode();
 
-    // Acquire active session for immediate authenticated experience
-    if (!session) {
-      try {
-        const authClient = createAuthClient();
-        const { data: signInData } = await authClient.auth.signInWithPassword({ email, password });
-        if (signInData?.session) {
-          session = signInData.session;
-        }
-      } catch (e) {
-        console.warn("Sign-in step notice:", e?.message);
-      }
-    }
+    // Insert profile (only columns that exist in the current schema)
+    await supabase.from("profiles").upsert({
+      id: userId,
+      email,
+      display_name: displayName,
+      referral_code: refCode,
+      referred_by: validReferredBy,
+      status: "active",
+    });
 
+    // Welcome notification
     try {
-      await supabase.from("profiles").upsert({
-        id: userId,
-        email,
-        display_name: name,
-        referral_code: refCode,
-        referred_by: validReferredBy,
-        status: "active",
-      });
-    } catch (e) {
-      console.warn("Could not upsert profile:", e?.message);
-    }
-
-    try {
-      const { error: notifError } = await supabase.from("notifications").insert({
+      await supabase.from("notifications").insert({
         user_id: userId,
-        title: "Welcome to NovaSpark",
+        title: `Welcome to ${config.BRAND_NAME}`,
         message: "Your account has been created. Connect your wallet to complete setup.",
         type: "success",
       });
-      if (notifError) console.error("REGISTER NOTIF ERROR:", notifError);
     } catch (e) {
       console.warn("Could not insert welcome notification:", e?.message);
     }
 
     await recordAuditLog(userId, "auth.register", { email, referralCode: validReferredBy }, req.ip);
 
+    // Auto sign-in immediately after registration
+    let session = null;
+    try {
+      const authClient = createAuthClient();
+      const { data: signInData } = await authClient.auth.signInWithPassword({ email, password });
+      session = signInData?.session || null;
+    } catch (e) {
+      console.warn("Auto sign-in after registration failed:", e?.message);
+    }
+
     return res.status(201).json({
       ok: true,
       user: {
         id: userId,
         email,
-        displayName: name,
+        displayName,
         referralCode: refCode,
         referredBy: validReferredBy,
       },
@@ -192,7 +217,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// POST /api/auth/login
+// ─── POST /api/auth/login ──────────────────────────────────────────────────────
 router.post("/login", async (req, res) => {
   const result = loginSchema.safeParse(req.body);
   if (!result.success) {
@@ -203,12 +228,9 @@ router.post("/login", async (req, res) => {
 
   try {
     const authClient = createAuthClient();
-    let { data, error } = await authClient.auth.signInWithPassword({
-      email,
-      password,
-    });
+    let { data, error } = await authClient.auth.signInWithPassword({ email, password });
 
-    // Auto-confirm if needed for unconfirmed emails
+    // Auto-confirm if needed
     if (error && error.message === "Email not confirmed") {
       try {
         const { data: userList } = await supabase.auth.admin.listUsers();
@@ -221,7 +243,7 @@ router.post("/login", async (req, res) => {
           error = retry.error;
         }
       } catch (e) {
-        console.warn("Notice: auto-confirm fallback error:", e?.message);
+        console.warn("Auto-confirm fallback:", e?.message);
       }
     }
 
@@ -235,13 +257,27 @@ router.post("/login", async (req, res) => {
       .eq("id", data.user.id)
       .single();
 
+    if (profile && profile.status !== "active") {
+      return res.status(403).json({
+        error: `Account ${profile.status}`,
+        status: profile.status,
+      });
+    }
+
     await recordAuditLog(data.user.id, "auth.login", { email }, req.ip);
 
     return res.json({
       ok: true,
       session: data.session,
       user: data.user,
-      profile: profile || null,
+      profile: profile
+        ? {
+            ...profile,
+            unique_user_id: profile.unique_user_id,
+            status: profile.status,
+            country_iso2: profile.country_iso2,
+          }
+        : null,
     });
   } catch (err) {
     console.error("Unexpected error in /login:", err);
@@ -249,7 +285,7 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// GET /api/auth/me
+// ─── GET /api/auth/me ─────────────────────────────────────────────────────────
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const { data: profile } = await supabase
@@ -276,7 +312,8 @@ router.get("/me", requireAuth, async (req, res) => {
         id: req.user.id,
         email: req.user.email,
         display_name: req.user.user_metadata?.display_name || req.user.email?.split("@")[0],
-        referral_code: "NSP-MEMBER",
+        referral_code: null,
+        status: "active",
       },
       wallets: wallets || [],
       unreadNotifications: unreadNotifications || 0,
@@ -287,6 +324,7 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 });
 
+// ─── Nonce store ─────────────────────────────────────────────────────────────
 const memoryNonces = new Map();
 
 function saveNonce(address, nonce, expiresAt) {
@@ -294,7 +332,6 @@ function saveNonce(address, nonce, expiresAt) {
     nonce,
     expiresAt: new Date(expiresAt).getTime(),
   });
-  // Also persist to Supabase if table exists
   supabase
     .from("auth_nonces")
     .insert({ address: address.toLowerCase(), nonce, expires_at: expiresAt })
@@ -328,7 +365,7 @@ async function getAndConsumeNonce(address) {
   return null;
 }
 
-// POST /api/auth/nonce
+// ─── POST /api/auth/nonce ─────────────────────────────────────────────────────
 router.post("/nonce", async (req, res) => {
   const result = nonceSchema.safeParse(req.body);
   if (!result.success) {
@@ -341,15 +378,24 @@ router.post("/nonce", async (req, res) => {
 
   saveNonce(address, nonce, expiresAt);
 
-  const message = `Sign this message to authenticate with NovaSpark: ${nonce}`;
-  return res.json({
-    ok: true,
-    nonce,
-    message,
-  });
+  const domain = new URL(config.FRONTEND_URL).hostname;
+  const issuedAt = new Date().toISOString();
+  const message = [
+    `${domain} wants you to sign in with your Ethereum account:`,
+    address,
+    "",
+    `Sign in to ${config.BRAND_NAME}`,
+    "",
+    `URI: ${config.FRONTEND_URL}`,
+    `Version: 1`,
+    `Nonce: ${nonce}`,
+    `Issued At: ${issuedAt}`,
+  ].join("\n");
+
+  return res.json({ ok: true, nonce, message });
 });
 
-// POST /api/auth/verify-wallet
+// ─── POST /api/auth/verify-wallet ─────────────────────────────────────────────
 router.post("/verify-wallet", optionalAuth, async (req, res) => {
   const result = verifyWalletSchema.safeParse(req.body);
   if (!result.success) {
@@ -362,22 +408,35 @@ router.post("/verify-wallet", optionalAuth, async (req, res) => {
   try {
     const activeNonce = await getAndConsumeNonce(address);
     if (!activeNonce) {
-      return res.status(400).json({ error: "No active challenge nonce found. Request a new nonce." });
+      return res.status(400).json({ error: "Session expired. Please request a new nonce." });
     }
 
-    const expectedMessage = `Sign this message to authenticate with NovaSpark: ${activeNonce}`;
+    // Accept either a provided message (EIP-4361) or reconstruct it
+    let expectedMessage = result.data.message;
+    if (!expectedMessage) {
+      const domain = new URL(config.FRONTEND_URL).hostname;
+      expectedMessage = [
+        `${domain} wants you to sign in with your Ethereum account:`,
+        address,
+        "",
+        `Sign in to ${config.BRAND_NAME}`,
+        "",
+        `URI: ${config.FRONTEND_URL}`,
+        `Version: 1`,
+        `Nonce: ${activeNonce}`,
+      ].join("\n");
+    }
 
     const isValid = await verifyMessage({
-      address: address,
+      address,
       message: expectedMessage,
-      signature: signature,
+      signature,
     });
 
     if (!isValid) {
       return res.status(400).json({ error: "Cryptographic signature verification failed" });
     }
 
-    // Prevent wallet conflict: cannot link a wallet already linked to another account
     const { data: existingWallet } = await supabase
       .from("wallets")
       .select("id, user_id, address")
@@ -386,7 +445,7 @@ router.post("/verify-wallet", optionalAuth, async (req, res) => {
 
     if (existingWallet && req.user?.id && existingWallet.user_id !== req.user.id) {
       return res.status(409).json({
-        error: "This wallet address is already linked to another NovaSpark account. Please unlink it from that account first.",
+        error: "This wallet address is already linked to another account.",
       });
     }
 
@@ -394,10 +453,9 @@ router.post("/verify-wallet", optionalAuth, async (req, res) => {
     let session = null;
     let user = req.user || null;
 
-    // If user is not already authenticated, perform 1-click Web3 login
     if (!targetUserId) {
-      const walletEmail = `${address}@wallet.novaspark.io`;
-      const walletPassword = `NSP_Wallet_${address}_AuthKey!`;
+      const walletEmail = `${address}@wallet.${new URL(config.FRONTEND_URL).hostname}`;
+      const walletPassword = `WLT_${address}_${config.JWT_SECRET.slice(0, 8)}!`;
 
       const authClient = createAuthClient();
       const { data: signInData } = await authClient.auth.signInWithPassword({
@@ -438,7 +496,7 @@ router.post("/verify-wallet", optionalAuth, async (req, res) => {
           {
             user_id: targetUserId,
             address,
-            chain_id: 56,
+            chain_id: config.CHAIN_ID || 97,
             is_primary: true,
             verified_at: new Date().toISOString(),
           },
@@ -448,55 +506,185 @@ router.post("/verify-wallet", optionalAuth, async (req, res) => {
         console.warn("Could not upsert wallet record:", err?.message);
       }
 
-      try {
-        const { error: notifErr } = await supabase.from("notifications").insert({
-          user_id: targetUserId,
-          title: "Wallet Verified",
-          message: `Wallet ${address.slice(0, 6)}...${address.slice(-4)} successfully verified on BNB Smart Chain.`,
-          type: "success",
-        });
-        if (notifErr) console.error("WALLET NOTIF ERROR:", notifErr);
-      } catch (err) {
-        console.warn("Could not insert notification:", err?.message);
-      }
-
-      await recordAuditLog(targetUserId, "wallet.verify", { address, chainId: 56 }, req.ip);
+      await recordAuditLog(targetUserId, "wallet.verify", { address }, req.ip);
     }
 
-    return res.json({
-      ok: true,
-      address,
-      verified: true,
-      session,
-      user,
-    });
+    // Check account status if user exists
+    if (targetUserId) {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("status")
+        .eq("id", targetUserId)
+        .maybeSingle();
+
+      if (profile && profile.status !== "active") {
+        return res.status(403).json({
+          error: `Account ${profile.status}`,
+          status: profile.status,
+        });
+      }
+    }
+
+    return res.json({ ok: true, address, verified: true, session, user });
   } catch (err) {
     console.error("Error verifying wallet signature:", err);
     return res.status(500).json({ error: "Failed to verify signature" });
   }
 });
 
-// POST /api/auth/forgot-password
+// ─── POST /api/auth/otp/send ──────────────────────────────────────────────────
+router.post("/otp/send", otpSendLimiter, async (req, res) => {
+  const result = otpSendSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error.issues[0]?.message || "Invalid input" });
+  }
+
+  const { destination, type } = result.data;
+
+  try {
+    // Check cooldown: if a non-consumed OTP was created < 60s ago, throttle
+    const cooldownWindow = new Date(Date.now() - 60_000).toISOString();
+    const { data: recentOtp } = await supabase
+      .from("email_otps")
+      .select("created_at")
+      .eq("destination", destination)
+      .eq("type", type)
+      .eq("consumed", false)
+      .gt("expires_at", new Date().toISOString())
+      .gt("created_at", cooldownWindow)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (recentOtp) {
+      const createdAt = new Date(recentOtp.created_at).getTime();
+      const retryAfter = Math.ceil((createdAt + 60_000 - Date.now()) / 1000);
+      return res.status(429).json({
+        error: "Please wait before requesting another code",
+        retryAfter,
+      });
+    }
+
+    // Generate code
+    const code = String(crypto.randomInt(100000, 999999));
+    const codeHash = await bcrypt.hash(code, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    await supabase.from("email_otps").insert({
+      destination,
+      code_hash: codeHash,
+      type,
+      expires_at: expiresAt,
+    });
+
+    // Send email
+    await resend.emails.send({
+      from: config.EMAIL_FROM,
+      to: destination,
+      subject: "Your verification code",
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"></head>
+        <body style="font-family:sans-serif;background:#f9f9f9;margin:0;padding:0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#f9f9f9;padding:40px 0;">
+            <tr><td align="center">
+              <table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;padding:40px;border:1px solid #e5e7eb;">
+                <tr><td>
+                  <h2 style="margin:0 0 24px;font-size:20px;color:#111827;">Verification code</h2>
+                  <p style="margin:0 0 24px;color:#374151;font-size:15px;">Use the code below to verify your identity:</p>
+                  <div style="text-align:center;margin:32px 0;">
+                    <span style="font-size:40px;font-weight:bold;letter-spacing:8px;color:#111827;font-family:monospace;">${code}</span>
+                  </div>
+                  <p style="margin:0 0 12px;color:#6b7280;font-size:13px;">This code expires in <strong>10 minutes</strong>.</p>
+                  <p style="margin:0;color:#6b7280;font-size:13px;">If you did not request this, you can safely ignore this email.</p>
+                </td></tr>
+              </table>
+            </td></tr>
+          </table>
+        </body>
+        </html>
+      `,
+    });
+
+    return res.json({ success: true, expiresIn: 600 });
+  } catch (err) {
+    console.error("Error in /otp/send:", err);
+    return res.status(500).json({ error: "Failed to send verification code" });
+  }
+});
+
+// ─── POST /api/auth/otp/verify ─────────────────────────────────────────────────
+router.post("/otp/verify", async (req, res) => {
+  const result = otpVerifySchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error.issues[0]?.message || "Invalid input" });
+  }
+
+  const { destination, code, type } = result.data;
+
+  try {
+    const { data: otp } = await supabase
+      .from("email_otps")
+      .select("*")
+      .eq("destination", destination)
+      .eq("type", type)
+      .eq("consumed", false)
+      .gt("expires_at", new Date().toISOString())
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!otp) {
+      return res.status(400).json({ error: "No active OTP found. Please request a new code." });
+    }
+
+    // Increment attempts
+    const newAttempts = otp.attempts + 1;
+    await supabase
+      .from("email_otps")
+      .update({ attempts: newAttempts })
+      .eq("id", otp.id);
+
+    if (newAttempts > 5) {
+      await supabase.from("email_otps").update({ consumed: true }).eq("id", otp.id);
+      return res.status(429).json({ error: "Too many attempts. Please request a new code." });
+    }
+
+    const match = await bcrypt.compare(code, otp.code_hash);
+    if (!match) {
+      const attemptsRemaining = 5 - newAttempts;
+      return res.status(400).json({ error: "Invalid code", attemptsRemaining });
+    }
+
+    await supabase.from("email_otps").update({ consumed: true }).eq("id", otp.id);
+    return res.json({ verified: true });
+  } catch (err) {
+    console.error("Error in /otp/verify:", err);
+    return res.status(500).json({ error: "Failed to verify code" });
+  }
+});
+
+// ─── POST /api/auth/forgot-password ───────────────────────────────────────────
 router.post("/forgot-password", async (req, res) => {
   const { email } = req.body;
   if (!email || typeof email !== "string") {
     return res.status(400).json({ error: "Email is required" });
   }
   try {
-    const origin = req.headers.origin || "http://localhost:8080";
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
-      redirectTo: `${origin}/reset-password`,
+      redirectTo: `${config.FRONTEND_URL}/reset-password`,
     });
     if (error) {
-      console.warn("Notice: resetPasswordForEmail warning:", error.message);
+      console.warn("resetPasswordForEmail warning:", error.message);
       if (error.status === 429 || error.message?.toLowerCase().includes("rate limit")) {
-        return res.status(429).json({ error: "Too many reset requests. Please wait a few minutes before trying again." });
+        return res.status(429).json({ error: "Too many reset requests. Please wait before trying again." });
       }
     }
     await recordAuditLog(null, "auth.forgot_password", { email: email.trim().toLowerCase() }, req.ip);
     return res.json({
       ok: true,
-      message: "If an account exists for this email, password reset instructions have been sent.",
+      message: "If an account with that email exists, you will receive a reset link shortly.",
     });
   } catch (err) {
     console.error("Error in /forgot-password:", err);
@@ -504,11 +692,11 @@ router.post("/forgot-password", async (req, res) => {
   }
 });
 
-// POST /api/auth/reset-password
+// ─── POST /api/auth/reset-password ────────────────────────────────────────────
 router.post("/reset-password", requireAuth, async (req, res) => {
   const { password } = req.body;
-  if (!password || password.length < 6) {
-    return res.status(400).json({ error: "Password must be at least 6 characters" });
+  if (!password || password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
   }
   try {
     const { error } = await supabase.auth.admin.updateUserById(req.user.id, { password });
@@ -523,9 +711,14 @@ router.post("/reset-password", requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/auth/logout
+// ─── POST /api/auth/logout ─────────────────────────────────────────────────────
 router.post("/logout", optionalAuth, async (req, res) => {
   if (req.user?.id) {
+    try {
+      await supabase.auth.admin.signOut(req.user.id);
+    } catch (e) {
+      console.warn("signOut warning:", e?.message);
+    }
     await recordAuditLog(req.user.id, "auth.logout", {}, req.ip);
   }
   return res.json({ ok: true });

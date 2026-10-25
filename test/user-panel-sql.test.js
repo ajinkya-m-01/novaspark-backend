@@ -1,0 +1,28 @@
+import test,{before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {PGlite} from '@electric-sql/pglite';
+const db=new PGlite();
+const uid='11111111-1111-4111-8111-111111111111';
+const id='22222222-2222-4222-8222-222222222222';
+const kyc={fullName:'Ada Test',dateOfBirth:'1990-01-01',country:'India',documentType:'passport',documentNumber:'ABC',front:'front',back:'back',selfie:'selfie'};
+before(async()=>{
+ await db.exec(`CREATE ROLE anon;CREATE ROLE authenticated;CREATE ROLE service_role;
+ CREATE TABLE profiles(id uuid primary key,kyc_status text default 'not_started');
+ CREATE TABLE notifications(id uuid default gen_random_uuid(),user_id uuid,title text,message text,type text,link text,link_type text);
+ CREATE TABLE kyc_submissions(id uuid primary key default gen_random_uuid(),user_id uuid,document_type text CHECK(document_type IN ('passport','national_id','drivers_license')),document_number text,full_name text,date_of_birth date,country_iso2 text,front_url text,back_url text,selfie_url text,status text,reason text,submitted_at timestamptz,created_at timestamptz default now());
+ CREATE TABLE support_tickets(id uuid primary key default gen_random_uuid(),user_id uuid,subject text,category text,status text default 'open',updated_at timestamptz default now());
+ CREATE TABLE support_messages(id uuid primary key default gen_random_uuid(),ticket_id uuid references support_tickets(id),sender_id uuid,message text);
+ CREATE TABLE withdrawal_requests(id uuid primary key default gen_random_uuid(),user_id uuid,amount numeric(36,18),symbol text,wallet_address text,status text CHECK(status IN ('pending','approved','rejected','processed')));
+ INSERT INTO profiles(id) VALUES('${uid}');`);
+ await db.exec(await readFile(new URL('../sql/0007_user_panel_real.sql',import.meta.url),'utf8'));
+});
+after(()=>db.close());
+const rpc=async(name,args)=>db.query(`SELECT ${name}(${args.map((_,i)=>'$'+(i+1)).join(',')}) AS result`,args);
+test('SQL migration can be applied twice without duplicate tiers',async()=>{await db.exec(await readFile(new URL('../sql/0007_user_panel_real.sql',import.meta.url),'utf8'));assert.equal((await db.query('SELECT count(*) FROM membership_tiers')).rows[0].count,5);});
+test('SQL KYC submission persists application, profile and notification atomically',async()=>{const r=await rpc('user_panel_kyc_submit',[uid,kyc]);assert.ok(r.rows[0].result);assert.equal((await db.query('SELECT kyc_status FROM profiles WHERE id=$1',[uid])).rows[0].kyc_status,'pending');assert.equal((await db.query('SELECT count(*) FROM notifications')).rows[0].count,1);await assert.rejects(rpc('user_panel_kyc_submit',[uid,kyc]),/KYC_DUPLICATE/);});
+test('SQL KYC reset rejects pending, permits rejected, returns cleanup paths',async()=>{await assert.rejects(rpc('user_panel_kyc_reset',[uid]),/KYC_RESET/);await db.exec("UPDATE kyc_submissions SET status='rejected'");const r=await rpc('user_panel_kyc_reset',[uid]);assert.deepEqual(r.rows[0].result,['front','back','selfie']);assert.equal((await db.query('SELECT count(*) FROM kyc_submissions')).rows[0].count,0);});
+test('SQL ticket creation enforces five active tickets and persists first message',async()=>{for(let i=0;i<5;i++)await rpc('user_panel_ticket_create',[uid,`22222222-2222-4222-8222-22222222222${i}`,{subject:'Help',category:'account',message:'Please help me',attachments:[{name:'file',url:'path',size:4}]}]);await assert.rejects(rpc('user_panel_ticket_create',[uid,id,{subject:'Sixth',category:'account',message:'Please help'}]),/OPEN_TICKET_LIMIT/);assert.equal((await db.query('SELECT count(*) FROM support_messages')).rows[0].count,5);});
+test('SQL reply reopens resolved tickets and rejects closed or foreign tickets',async()=>{const ticketId='22222222-2222-4222-8222-222222222220';await db.query("UPDATE support_tickets SET status='resolved' WHERE id=$1",[ticketId]);await rpc('user_panel_ticket_reply',[uid,ticketId,{message:'Thanks'}]);assert.equal((await db.query('SELECT status FROM support_tickets WHERE id=$1',[ticketId])).rows[0].status,'open');await db.query("UPDATE support_tickets SET status='closed' WHERE id=$1",[ticketId]);await assert.rejects(rpc('user_panel_ticket_reply',[uid,ticketId,{message:'More'}]),/TICKET_CLOSED/);await assert.rejects(rpc('user_panel_ticket_reply',[id,ticketId,{message:'More'}]),/NOT_FOUND/);});
+test('SQL withdrawal gates on KYC, prevents duplicates and stores exact amount',async()=>{const payload={amount:'0.100000000000000001',symbol:'TOKEN',walletAddress:'0x'+'a'.repeat(40)};await assert.rejects(rpc('user_panel_withdrawal_create',[uid,payload]),/KYC_REQUIRED/);await db.query("UPDATE profiles SET kyc_status='approved' WHERE id=$1",[uid]);await rpc('user_panel_withdrawal_create',[uid,payload]);await assert.rejects(rpc('user_panel_withdrawal_create',[uid,payload]),/WITHDRAWAL_PENDING/);assert.equal((await db.query('SELECT amount::text AS amount FROM withdrawal_requests')).rows[0].amount,payload.amount);});
+test('SQL mutation functions are not callable by authenticated clients',async()=>{const r=await db.query("SELECT has_function_privilege('authenticated','user_panel_kyc_submit(uuid,jsonb)','EXECUTE') AS allowed");assert.equal(r.rows[0].allowed,false);});
